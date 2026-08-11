@@ -1,0 +1,1476 @@
+#将原始对话数据转换为适合大语言模型（LLM）训练的提示工程格式
+import csv
+import json
+import re
+import faiss  # 添加FAISS向量检索库
+import os
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from tqdm import tqdm
+import similarity_matrix
+
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com' 
+# === 新增：加载情感检索库并构建FAISS索引 ===
+def load_retrieval_library(retrieval_path):
+    """加载情感检索库并构建FAISS索引"""
+    with open(retrieval_path, 'r', encoding='utf-8') as f:
+        retrieval_data = json.load(f)
+    
+    # 提取向量和元数据
+    vectors = []
+    metadata = []
+    # ===== 新增：带进度条的遍历 =====
+    print(f"加载检索库 ({len(retrieval_data)} 个样本):")
+    for sample in tqdm(retrieval_data, desc="Processing", unit="sample"):
+        vectors.append(sample['vector'])
+        metadata.append({
+            'text': sample['text'],
+            'label': sample['label'],
+            'dataset': sample['dataset'],
+            'conversation_id': sample['conversation_id'],
+            'utterance_id': sample['utterance_id']
+        })
+    
+    # 转换为numpy数组
+    vectors = np.array(vectors).astype('float32')
+    #faiss.normalize_L2(vectors)#归一化向量
+    # 创建FAISS索引
+    dimension = vectors.shape[1]
+    index = faiss.IndexFlatL2(dimension) #这里是L2距离
+    #index = faiss.IndexFlatIP(dimension)  # 使用内积代替L2距离
+    index.add(vectors)
+    
+    return index, metadata, vectors
+
+# 初始化检索库（全局只加载一次）
+RETRIEVAL_PATH = "./data/Emotion_Retrieval_Library.json"
+print(f"使用的是：{RETRIEVAL_PATH}\n")
+retrieval_index, retrieval_metadata, retrieval_vectors = load_retrieval_library(RETRIEVAL_PATH)
+sentence_model = SentenceTransformer('all-MiniLM-L6-v2',device='cpu')  # 与检索库相同的向量模型
+
+DEFAULT_MELD_SENTIMENT_CSVS = {
+    "train": "/scratch/data/bikash_rs/Vivek/dataset/MELD/MELD.Raw/train_sent_emo.csv",
+    "valid": "/scratch/data/bikash_rs/Vivek/dataset/MELD/MELD.Raw/dev_sent_emo.csv",
+    "test": "/scratch/data/bikash_rs/Vivek/dataset/MELD/MELD.Raw/test_sent_emo.csv",
+}
+
+_MELD_SENTIMENT_CACHE = {}
+# === 新增：检索相似样本函数 ===
+def retrieve_similar_samples(query_text, current_id, d_type, k=3):
+    """
+    从检索库中查找相似样本
+    :param query_text: 查询文本
+    :param current_id: 当前样本ID (用于排除自身)
+    :param d_type: 数据类型 (train/valid/test)
+    :param k: 返回的相似样本数量
+    """
+    # 生成查询向量
+    query_vec = sentence_model.encode([query_text], convert_to_tensor=False)
+    query_vec = np.array(query_vec).astype('float32')
+    #faiss.normalize_L2(query_vec)
+    # FAISS检索
+    distances, indices = retrieval_index.search(query_vec, k+5)  # 多取几个备选
+    
+    results = []
+    # 修复：同时遍历距离和索引
+    for dist, idx in zip(distances[0], indices[0]):
+        # 跳过无效索引
+        if idx < 0 or idx >= len(retrieval_metadata):
+            continue
+            
+        sample = retrieval_metadata[idx]
+        
+        # 训练集排除自身样本
+        if d_type == 'train' and sample['conversation_id'] == current_id[0] and sample['utterance_id'] == current_id[1]:
+            continue
+            
+        results.append({
+            'text': sample['text'],
+            'label': sample['label'],
+            'dataset': sample['dataset'],
+            'distance': float(dist)
+            #'similarity': float(dist)  # 直接使用距离值或相似度值
+        })
+        
+        if len(results) >= k:
+            break
+    #results.sort(key=lambda x: x['similarity'], reverse=True) # 按相似度降序排序
+    return results
+
+
+def load_meld_sentiment_lookup(csv_path):
+    if csv_path in _MELD_SENTIMENT_CACHE:
+        return _MELD_SENTIMENT_CACHE[csv_path]
+
+    lookup = {}
+    dialogue_rows = {}
+    dialogue_id_order = []
+    with open(csv_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            dialogue_id = str(row["Dialogue_ID"])
+            utterance_id = int(row["Utterance_ID"])
+            record = {
+                "dialogue_id": dialogue_id,
+                "emotion_label": row["Emotion"].strip(),
+                "sentiment_label": row["Sentiment"].strip().lower(),
+                "speaker": row["Speaker"].strip(),
+                "utterance": row["Utterance"],
+                "csv_utterance_id": utterance_id,
+            }
+            lookup[(dialogue_id, utterance_id)] = record
+            if dialogue_id not in dialogue_rows:
+                dialogue_id_order.append(dialogue_id)
+            dialogue_rows.setdefault(dialogue_id, []).append(record)
+
+    payload = {
+        "by_dialogue_and_uttid": lookup,
+        "by_dialogue_order": dialogue_rows,
+        "dialogue_id_order": dialogue_id_order,
+    }
+    _MELD_SENTIMENT_CACHE[csv_path] = payload
+    return payload
+
+
+def get_meld_sentiment_lookup(multimodal_config, d_type):
+    csv_path = None
+    if multimodal_config is not None:
+        csv_path = multimodal_config.get("meld_sentiment_csv_map", {}).get(d_type)
+    if not csv_path:
+        csv_path = DEFAULT_MELD_SENTIMENT_CSVS.get(d_type)
+    if not csv_path:
+        return {}
+    return load_meld_sentiment_lookup(csv_path)
+
+
+def get_meld_sentiment_info(sentiment_lookup, dialogue_id, utterance_position, speaker, utterance_text):
+    if not sentiment_lookup:
+        return None
+
+    dialogue_id = str(dialogue_id)
+    by_id = sentiment_lookup.get("by_dialogue_and_uttid", {})
+    by_order = sentiment_lookup.get("by_dialogue_order", {})
+
+    direct_match = by_id.get((dialogue_id, int(utterance_position)))
+    if direct_match is not None:
+        return direct_match
+
+    dialogue_rows = by_order.get(dialogue_id, [])
+    if utterance_position < len(dialogue_rows):
+        ordered_match = dialogue_rows[utterance_position]
+        if ordered_match["speaker"] == speaker and ordered_match["utterance"] == utterance_text:
+            return ordered_match
+
+    exact_text_matches = [
+        row for row in dialogue_rows
+        if row["speaker"] == speaker and row["utterance"] == utterance_text
+    ]
+    if len(exact_text_matches) == 1:
+        return exact_text_matches[0]
+
+    return None
+
+
+def get_meld_dialogue_rows(sentiment_lookup, dialogue_id, dialogue_position=None):
+    if not sentiment_lookup:
+        return []
+
+    dialogue_id = str(dialogue_id)
+    by_order = sentiment_lookup.get("by_dialogue_order", {})
+    if dialogue_id in by_order:
+        return by_order[dialogue_id]
+
+    dialogue_id_order = sentiment_lookup.get("dialogue_id_order", [])
+    if dialogue_position is not None and 0 <= dialogue_position < len(dialogue_id_order):
+        mapped_dialogue_id = dialogue_id_order[dialogue_position]
+        return by_order.get(mapped_dialogue_id, [])
+
+    return []
+
+#对话情感分析任务的提示工程生成器
+data_name_pattern = 'train'
+#根据数据集类型生成可读的说话者标识
+def get_speaker_name(s_id, speaker_info, data_name):
+    """
+    参数重命名为 speaker_info：
+    - IEMOCAP：gender 参数（原逻辑）
+    - MELD：直接传入 speakers 列表中的姓名
+    - DailyDialog：保留原 gender 编码逻辑
+    """
+    if data_name == "iemocap":
+        # iemocap: label index mapping = {'hap':0, 'sad':1, 'neu':2, 'ang':3, 'exc':4, 'fru':5}
+        speaker = {
+                    "Ses01": {"F": "Mary", "M": "James"},
+                    "Ses02": {"F": "Patricia", "M": "John"},
+                    "Ses03": {"F": "Jennifer", "M": "Robert"},
+                    "Ses04": {"F": "Linda", "M": "Michael"},
+                    "Ses05": {"F": "Elizabeth", "M": "William"},
+                }
+        s_id_first_part = s_id[:5]
+        return speaker[s_id_first_part][speaker_info].upper()
+    if data_name == "meld":
+        return speaker_info 
+    if data_name in ['meld', "emorynlp"]:
+        # emorynlp: label index mapping =  {'Joyful': 0, 'Mad': 1, 'Peaceful': 2, 'Neutral': 3, 'Sad': 4, 'Powerful': 5, 'Scared': 6}
+        # meld: label index mapping = {'neutral': 0, 'surprise': 1, 'fear': 2, 'sadness': 3, 'joy': 4, 'disgust': 5, 'anger':6}
+        gender_idx = speaker_info.index(1) 
+        return f"SPEAKER_{gender_idx}"
+    elif data_name=='dailydialog':
+        # dailydialog:  {'no_emotion': 0, 'happiness': 1, 'sadness': 2, 'surprise': 3,  'anger': 4, 'fear': 5, 'disgust':6}
+        return f"SPEAKER_{speaker_info}"
+
+#对话上下文窗口生成器
+def flatten_conversation_mixed_by_surrounding(conv, around_window, s_id, genders, data_name):
+    new_data = []
+    ## 生成包含前后对话的上下文窗口（窗口大小由around_window控制）
+    for i, cur_sent in enumerate(conv):
+        tmp_window = []
+        for j in range(max(0, i-around_window), min(len(conv), i+around_window+1)):
+            tmp_window.append(f" {get_speaker_name(s_id, genders[j], data_name=data_name)}: {conv[j]}")
+
+        new_data.append(tmp_window)
+    return new_data
+
+#标签映射器
+def get_label_map(data_name):
+    all_data_label_map = {
+        "iemocap":   ['happy','sad','neutral','angry','excited','frustrated'],
+        "emorynlp":  ['Joyful', 'Mad', 'Peaceful', 'Neutral', 'Sad', 'Powerful', 'Scared'],
+        "meld":  ['neutral', 'surprise', 'fear', 'sadness', 'joy', 'disgust', 'anger'],
+        "dailydialog":  ['no_emotion', 'happiness', 'sadness', 'surprise',  'anger', 'fear', 'disgust']
+    }
+    return all_data_label_map[data_name]
+
+def get_emotion_map(data_name):
+    emotion_map = {
+        "iemocap":   {0: 'happy',1: 'sad',2: 'neutral',3: 'angry',4: 'excited',5: 'frustrated'},
+        "emorynlp":  {0: 'joyful',1:  'mad', 2: 'peaceful',3: 'neutral',4: 'sad',5: 'powerful',6: 'fear'},
+        "meld":  {0: 'neutral',1: 'surprise',2: 'fear',3: 'sadness',4: 'joy',5: 'disgust',6: 'anger'},
+        "dailydialog":  {1:'no_emotion',2: 'happiness',3: 'sadness',4: 'surprise',5:  'anger', 6: 'fear', 7: 'disgust'}
+    }
+    return emotion_map[data_name]
+
+#对描述性文本（可能包含特殊标记 <s> 和 </s>）进行预处理，去除不需要的部分和多余空格。
+def preprocess_desc_speaker(str_in):
+    str_in = str_in.split("</s>")[0].replace("<s>", "").replace("\n", " ")
+    str_out = re.sub(r" {2,}", " ",  str_in)
+    return str_out
+
+def load_dialogue_visual_expressions(folder_data, d_type, data_name=None):
+    """Load split-specific OpenFace visual expression annotations if available."""
+    split_name_map = {
+        "train": "train",
+        "valid": "valid" if data_name == "iemocap" else "dev",
+        "test": "test",
+    }
+    split_name = split_name_map.get(d_type)
+    if split_name is None:
+        return {}
+
+    if data_name == "iemocap":
+        visual_path = os.path.join(
+            folder_data,
+            f"iemocap_{split_name}_openface_utterance_wise_visual_descriptions.json",
+        )
+    else:
+        visual_path = os.path.join(folder_data, f"{split_name}_dialogue_visual_expressions.json")
+    if not os.path.exists(visual_path):
+        print(f" Visual expression file not found: {visual_path}")
+        return {}
+
+    with open(visual_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def load_dialogue_audio_descriptions(folder_data, d_type, data_name=None):
+    """Load split-specific audio description annotations if available."""
+    split_name_map = {
+        "train": "train",
+        "valid": "valid" if data_name == "iemocap" else "dev",
+        "test": "test",
+    }
+    split_name = split_name_map.get(d_type)
+    if split_name is None:
+        return {}
+
+    if data_name == "iemocap":
+        audio_path = os.path.join(
+            folder_data,
+            f"iemocap_{split_name}_opensmile_utterance_wise_audio_descriptions.json",
+        )
+    else:
+        audio_path = os.path.join(folder_data, f"opensmile_{split_name}_features_audio_descriptions.json")
+    if not os.path.exists(audio_path):
+        print(f" Audio description file not found: {audio_path}")
+        return {}
+
+    with open(audio_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def load_dialogue_llm_audio_visual_descriptions(folder_data, data_name, d_type, llm_id="qwen_2_5_omni_7b"):
+    """Load split-specific LLM-generated audio/visual descriptions if available."""
+    desc_path = os.path.join(folder_data, f"{data_name}.{d_type}_AudioVisualDescriptions_V1_{llm_id}.json")
+    if not os.path.exists(desc_path):
+        raise FileNotFoundError(f"LLM audio/visual description file not found: {desc_path}")
+
+    with open(desc_path, "r", encoding="utf-8") as f:
+        desc_data = json.load(f)
+
+    if not isinstance(desc_data, dict):
+        raise ValueError(f"Expected a dialogue-id keyed JSON object in {desc_path}")
+
+    for dialogue_id, dialogue_data in desc_data.items():
+        if not isinstance(dialogue_data, dict):
+            raise ValueError(f"Expected dialogue {dialogue_id} in {desc_path} to be a JSON object")
+        utterances = dialogue_data.get("utterances")
+        predictions = dialogue_data.get("emotion_predictions")
+        if not isinstance(utterances, list) or not isinstance(predictions, list):
+            raise ValueError(
+                f"Expected dialogue {dialogue_id} in {desc_path} to contain list fields "
+                "'utterances' and 'emotion_predictions'"
+            )
+        if len(utterances) != len(predictions):
+            raise ValueError(
+                f"Dialogue {dialogue_id} in {desc_path} has {len(utterances)} utterances "
+                f"but {len(predictions)} emotion_predictions"
+            )
+        for utterance_id, prediction in enumerate(predictions):
+            if not isinstance(prediction, dict):
+                raise ValueError(
+                    f"Expected emotion_predictions[{utterance_id}] for dialogue {dialogue_id} "
+                    f"in {desc_path} to be a JSON object"
+                )
+
+    return desc_data
+
+def _wrap_text_message(role, text):
+    return {"role": role, "content": [{"type": "text", "text": text}]}
+
+def _resolve_image_path(image_dir, base_name):
+    if not image_dir:
+        return None
+
+    for extension in [".jpg", ".jpeg", ".png", ".webp", ".bmp"]:
+        candidate = os.path.join(image_dir, f"{base_name}{extension}")
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+def _get_selected_media_inputs(multimodal_config):
+    if multimodal_config is None:
+        return []
+
+    selected_inputs = []
+    if multimodal_config.get("video_input"):
+        selected_inputs.append("video")
+    if multimodal_config.get("image_input"):
+        selected_inputs.append("image")
+    if multimodal_config.get("audio_input"):
+        selected_inputs.append("audio")
+
+    if not selected_inputs and multimodal_config.get("multimodal_chat_format"):
+        # Preserve previous Omni generation behavior when no explicit media flags are set.
+        selected_inputs = ["video", "audio"]
+
+    return selected_inputs
+
+def _format_media_input_phrase(selected_inputs, definite=True):
+    if not selected_inputs:
+        return ""
+
+    phrase_map = {
+        "video": "video clip of the current target utterance",
+        "image": "face-cropped image of the active speaker",
+        "audio": "separately extracted audio clip of the current target utterance",
+    }
+
+    phrases = [phrase_map[media_type] for media_type in selected_inputs]
+    if definite:
+        phrases = [f"the {phrase}" for phrase in phrases]
+    else:
+        article_map = {
+            "video": "a",
+            "image": "a",
+            "audio": "a",
+        }
+        phrases = [f"{article_map[media_type]} {phrase_map[media_type]}" for media_type in selected_inputs]
+
+    if len(phrases) == 1:
+        return phrases[0]
+    if len(phrases) == 2:
+        return f"{phrases[0]} and {phrases[1]}"
+    return ", ".join(phrases[:-1]) + f", and {phrases[-1]}"
+
+def _build_meld_media_paths(s_id, utter_idx, multimodal_config, d_type, dialogue_media_id=None, utterance_media_id=None):
+    if multimodal_config is None:
+        return None, None, None
+
+    video_dir_map = {
+        "train": multimodal_config.get("meld_train_video_dir"),
+        "valid": multimodal_config.get("meld_valid_video_dir"),
+        "test": multimodal_config.get("meld_test_video_dir"),
+    }
+    audio_dir_map = {
+        "train": multimodal_config.get("meld_train_audio_dir"),
+        "valid": multimodal_config.get("meld_valid_audio_dir"),
+        "test": multimodal_config.get("meld_test_audio_dir"),
+    }
+    image_dir_map = {
+        "train": multimodal_config.get("meld_train_image_dir"),
+        "valid": multimodal_config.get("meld_valid_image_dir"),
+        "test": multimodal_config.get("meld_test_image_dir"),
+    }
+
+    video_dir = video_dir_map.get(d_type)
+    audio_dir = audio_dir_map.get(d_type)
+    image_dir = image_dir_map.get(d_type)
+    dialogue_media_id = s_id if dialogue_media_id is None else dialogue_media_id
+    utterance_media_id = utter_idx if utterance_media_id is None else utterance_media_id
+    base_name = f"dia{dialogue_media_id}_utt{utterance_media_id}"
+
+    video_path = os.path.join(video_dir, f"{base_name}.mp4") if video_dir else None
+    audio_path = os.path.join(audio_dir, f"{base_name}.wav") if audio_dir else None
+    image_path = _resolve_image_path(image_dir, base_name)
+
+    if video_path and not os.path.exists(video_path):
+        video_path = None
+    if audio_path and not os.path.exists(audio_path):
+        audio_path = None
+    if image_path and not os.path.exists(image_path):
+        image_path = None
+
+    return video_path, audio_path, image_path
+
+def _build_multimodal_messages(system_msg, user_msg, label_msg, video_path=None, audio_path=None, image_path=None):
+    user_content = []
+    if video_path:
+        user_content.append({"type": "video", "video": video_path})
+    if image_path:
+        user_content.append({"type": "image", "image": image_path})
+    if audio_path:
+        user_content.append({"type": "audio", "audio": audio_path})
+    user_content.append({"type": "text", "text": user_msg})
+
+    return [
+        _wrap_text_message("system", system_msg),
+        {"role": "user", "content": user_content},
+        _wrap_text_message("assistant", label_msg),
+    ]
+
+def _format_feature_list(use_visual_exp=False, use_audio_exp=False, use_llm_aud_vis_desc=False):
+    features = []
+    if use_visual_exp:
+        features.append("visual expressions")
+    if use_audio_exp:
+        features.append("audio characteristics")
+    if use_llm_aud_vis_desc:
+        features.append("audio and visual descriptions")
+    return features
+
+def _join_prompt_features(features):
+    if not features:
+        return ""
+    if len(features) == 1:
+        return features[0]
+    return ", ".join(features[:-1]) + f", and {features[-1]}"
+
+#生成多轮对话标注任务输入
+def gen_default_prompting_messages(data_name, conv, around_window, s_id, desc_speaker_data=None):
+    new_conv = []   #用于保存“说话人名 + 语句”的格式化对话。
+    samples = []    #最后返回的结果列表，每个元素是一个包含 prompt 对话的样本
+    for i,sent in enumerate(conv['sentences']):
+        #如果是 MELD 数据集，用 speakers[i]；否则用 genders[i]（如 IEMOCAP 用性别标识）。
+        param = conv['speakers'][i] if data_name == "meld" else conv['genders'][i]
+        #用 get_speaker_name 函数获取标准化的说话人名（如 Speaker A、Male Speaker 等）。
+        sent_name = get_speaker_name(s_id, param, data_name)
+        #构造格式为：SpeakerA: sentence
+        new_sent =  f'{sent_name}: {sent}'
+        #将格式化句子加入到 new_conv 列表中。
+        new_conv.append(new_sent)
+    #把所有格式化后的句子拼接成一个字符串，用换行符分隔（用于后续 context）.即，对话的所有句子
+    conv_str = "\n".join(new_conv)
+    
+    #生成“局部对话上下文”的列表 flatten_conv
+    #flatten_conv[i] 表示针对第 i 句话，取其前后 around_window 个句子构成的上下文（带说话人名）。
+    #将每个发言，构造为包含上下文的发言形式
+    flatten_conv = flatten_conversation_mixed_by_surrounding(conv['sentences'], around_window, s_id, conv['speakers'] if data_name == "meld" else conv['genders'], data_name)
+    
+    for i, sent in enumerate(new_conv):
+        #定义一个 system prompt：设定模型的角色是情感识别专家
+        system_msg = f'### You are an expert at analyzing the emotion of utterances among speakers in a conversation.\n'
+        #将第 i 个样本的局部上下文拼接成字符串。构造 context 提示：引导模型基于上下文来理解当前语句的语义。
+        conv_str = "\n".join(flatten_conv[i])
+        local_context_msg = f"\n### Given the following conversation as a context \n{conv_str}"
+        speaker_name = get_speaker_name(s_id, conv['speakers'][i] if data_name == "meld" else conv['genders'][i], data_name)
+        #构造用户问题提示，即让模型判断这个说话人当前这句话的情绪。
+        q_msg =  f'Based on above conversation, which emotional label of {speaker_name} in the utterance \"{conv["sentences"][i]}\".'
+        #获取当前语句第i句的具体真实情绪标签。   
+        label_msg =  get_label_map(data_name)[conv['labels'][i]]
+
+        #构造一组完整的对话消息，包括三部分：
+        '''
+        system：设定角色和上下文；
+        user：提出问题（哪句情绪是什么）；
+        assistant：真实标签作为答案。
+        '''
+        samples.append({
+            "messages":  [
+                {'role': "system", 'content': system_msg + local_context_msg},
+                {'role': "user", 'content': q_msg},
+                {'role': "assistant", 'content': label_msg},
+            ]
+        })
+    return samples
+     
+def gen_spdescV2_prompting_messages(data_name, conv, around_window, s_id, desc_speaker_data):
+    new_conv = []
+    for i,sent in enumerate(conv['sentences']):
+        param = conv['speakers'][i] if data_name == "meld" else conv['genders'][i]
+        sent_name = get_speaker_name(s_id, param, data_name)
+        new_sent =  f'{sent_name}: {sent}'
+        new_conv.append(new_sent)
+    conv_str = "\n".join(new_conv)
+    
+    flatten_conv = flatten_conversation_mixed_by_surrounding(conv['sentences'], around_window, s_id, conv['speakers'] if data_name == "meld" else conv['genders'], data_name)
+    
+    samples = []
+    for i, sent in enumerate(new_conv):
+        system_msg = f'### You are an expert at analyzing the emotion of utterances among speakers in a conversation.'
+        speaker_name = get_speaker_name(s_id, conv['speakers'][i] if data_name == "meld" else conv['genders'][i], data_name)
+        
+        #得到角色的特征描述
+        desc_str = desc_speaker_data[s_id][i].replace("\n", " ")
+        desc_msg = f'\n### Given the characteristic of this speaker, {speaker_name}: \n{desc_str}'
+        
+        conv_str = "\n".join(flatten_conv[i])
+        local_context_msg = f"\n### Given the following conversation as a context \n{conv_str}"
+        
+        q_msg =  f'Based on above conversation and characteristic of the speakers, which emotional label of {speaker_name} in the utterance \"{conv["sentences"][i]}\".'
+        label_msg = get_label_map(data_name)[conv['labels'][i]]
+        
+        samples.append({
+            "messages":  [
+                {'role': "system", 'content': system_msg + desc_msg + local_context_msg},
+                {'role': "user", 'content': q_msg},
+                {'role': "assistant", 'content': label_msg},
+            ]
+        })
+        
+    return samples 
+
+def gen_spdescV3_prompting_messages(data_name, conv, around_window, s_id, desc_speaker_data, retrieval_library, d_type):
+    new_conv = []
+    raw_utterances = conv['sentences']  # 新增：保存原始发言
+    for i,sent in enumerate(conv['sentences']):
+        param = conv['speakers'][i] if data_name == "meld" else conv['genders'][i]
+        sent_name = get_speaker_name(s_id, param, data_name)
+        new_sent =  f'{sent_name}: {sent}'
+        new_conv.append(new_sent)
+    conv_str = "\n".join(new_conv)
+    
+    flatten_conv = flatten_conversation_mixed_by_surrounding(conv['sentences'], around_window, s_id, conv['speakers'] if data_name == "meld" else conv['genders'], data_name)
+    
+    samples = []
+    for i, sent in enumerate(new_conv):
+        system_msg = f'### You are an expert at analyzing the emotion of utterances among speakers in a conversation.\nYour goal is to infer the most accurate **emotion label** for a given utterance.\n'
+        speaker_name = get_speaker_name(s_id, conv['speakers'][i] if data_name == "meld" else conv['genders'][i], data_name)
+        raw_utterance = raw_utterances[i]  # 获取原始发言文本
+        response = desc_speaker_data[s_id][i]["response"].replace("\n", " ")
+        # 从检索库中查找相似情感样本（训练集排除自身）
+        similar_samples = retrieve_similar_samples(
+            query_text=raw_utterance,
+            current_id=(s_id, i),
+            d_type=d_type,
+            k=3  # 返回3个最相似样本
+        )
+
+        # 构建示范文本
+        demonstration_str = "### Reference Similar Emotional Expressions:\n"
+        for idx, sample in enumerate(similar_samples, 1):
+            demonstration_str += (
+                f"{idx}. \"{sample['text']}\" → {sample['label']} "
+                f"(from {sample['dataset']}, distance: {sample['distance']:.2f})\n"
+            )
+        demonstration_str += "\n"
+        note = "Note: *Explicit Emotion* refers to the emotional state that a person outwardly expresses through their words, tone, facial expressions, or behavior. It is typically visible and can be directly perceived by others. For instance, someone loudly complaining might show a surface emotion of frustration or annoyance.\n*Implicit Emotion*, on the other hand, is the underlying emotional tendency that may not be directly expressed but can be inferred through context, common sense reasoning, or deeper understanding of the speaker’s situation. These emotions often reflect the speaker’s true feelings. \n"
+        
+        implicit_info_msg = (
+            f"\n### Speaker: {speaker_name}\n"
+            f"- {response}\n"
+        )
+        desc_msg = f'\n### Given the background of the conversation and the profile of this speaker: {implicit_info_msg}\n'
+        conv_str = "\n".join(flatten_conv[i])
+        local_context_msg = (f"\n### Given the following conversation as a context \n{conv_str}\n")
+        
+        emotion_labels = get_label_map(data_name)
+        labels_msg = f"### Available emotion labels: {', '.join(emotion_labels)}\n\n"
+        
+
+        q_msg =  f'Based on above conversation, background of the conversation and the profile of the speaker, which emotional label of {speaker_name} in the utterance \"{conv["sentences"][i]}\".'
+        label_msg = get_label_map(data_name)[conv['labels'][i]]
+        
+        samples.append({
+            "messages":  [
+                {'role': "system", 'content': system_msg + desc_msg + local_context_msg},
+                {'role': "user", 'content': q_msg},
+                {'role': "assistant", 'content': label_msg},
+            ]
+        })
+        
+    return samples 
+
+def gen_spdescV5_prompting_messages(data_name, conv, around_window, s_id, desc_speaker_data, retrieval_library, d_type):
+    new_conv = []
+    raw_utterances = conv['sentences']  # 新增：保存原始发言
+    for i,sent in enumerate(conv['sentences']):
+        param = conv['speakers'][i] if data_name == "meld" else conv['genders'][i]
+        sent_name = get_speaker_name(s_id, param, data_name)
+        new_sent =  f'{sent_name}: {sent}'
+        new_conv.append(new_sent)
+    conv_str = "\n".join(new_conv)
+    
+    flatten_conv = flatten_conversation_mixed_by_surrounding(conv['sentences'], around_window, s_id, conv['speakers'] if data_name == "meld" else conv['genders'], data_name)
+    
+    samples = []
+    for i, sent in enumerate(new_conv):
+        system_msg = f'### You are an expert at analyzing the emotion of utterances among speakers in a conversation.\nYour goal is to infer the most accurate **emotion label** for a given utterance.\n'
+        speaker_name = get_speaker_name(s_id, conv['speakers'][i] if data_name == "meld" else conv['genders'][i], data_name)
+        raw_utterance = raw_utterances[i]  # 获取原始发言文本
+        response = desc_speaker_data[s_id][i]["response"].replace("\n", " ")
+        # 从检索库中查找相似情感样本（训练集排除自身）
+        similar_samples = retrieve_similar_samples(
+            query_text=raw_utterance,
+            current_id=(s_id, i),
+            d_type=d_type,
+            k=3  # 返回3个最相似样本
+        )
+
+        # 构建示范文本
+        demonstration_str = "### Reference Similar Emotional Expressions:\n"
+        for idx, sample in enumerate(similar_samples, 1):
+            demonstration_str += (
+                f"{idx}. \"{sample['text']}\" → {sample['label']} "
+                f"(from {sample['dataset']}, similarity: {sample['similarity']:.2f})\n"
+            )
+        demonstration_str += "\n"
+        note = "Note: *Explicit Emotion* refers to the emotional state that a person outwardly expresses through their words, tone, facial expressions, or behavior. It is typically visible and can be directly perceived by others. For instance, someone loudly complaining might show a surface emotion of frustration or annoyance.\n*Implicit Emotion*, on the other hand, is the underlying emotional tendency that may not be directly expressed but can be inferred through context, common sense reasoning, or deeper understanding of the speaker’s situation. These emotions often reflect the speaker’s true feelings. \n"
+        
+        implicit_info_msg = (
+            f"\n### Speaker: {speaker_name}\n"
+            f"- {response}\n"
+        )
+        desc_msg = f'\n### Given the characteristic of this speaker: {implicit_info_msg}\n'
+        conv_str = "\n".join(flatten_conv[i])
+        local_context_msg = (f"\n### Given the following conversation as a context \n{conv_str}\n")
+        
+        emotion_labels = get_label_map(data_name)
+        labels_msg = f"### Available emotion labels: {', '.join(emotion_labels)}\n\n"
+        
+
+        q_msg =  f'Based on above conversation and characteristic of the speakers, which emotional label of {speaker_name} in the utterance \"{conv["sentences"][i]}\".'
+        label_msg = get_label_map(data_name)[conv['labels'][i]]
+        
+        samples.append({
+            "messages":  [
+                {'role': "system", 'content': system_msg + desc_msg + local_context_msg},
+                {'role': "user", 'content': q_msg},
+                {'role': "assistant", 'content': label_msg},
+            ]
+        })
+        
+    return samples 
+
+def gen_ImplicitEmotion_prompting_messages(data_name, conv, around_window, s_id, desc_speaker_data):
+    new_conv = []
+    for i,sent in enumerate(conv['sentences']):
+        param = conv['speakers'][i] if data_name == "meld" else conv['genders'][i]
+        sent_name = get_speaker_name(s_id, param, data_name)
+        new_sent =  f'{sent_name}: {sent}'
+        new_conv.append(new_sent)
+    conv_str = "\n".join(new_conv)
+    
+    flatten_conv = flatten_conversation_mixed_by_surrounding(conv['sentences'], around_window, s_id, conv['speakers'] if data_name == "meld" else conv['genders'], data_name)
+    
+    samples = []
+    for i, sent in enumerate(new_conv):
+        system_msg = f'### You are an expert at analyzing the emotion of utterances among speakers in a conversation.\n'
+        speaker_name = get_speaker_name(s_id, conv['speakers'][i] if data_name == "meld" else conv['genders'][i], data_name)
+        
+        #得到隐性标签和情绪描述的特征描述
+        emotion_label = desc_speaker_data[s_id][i]['emotion_label'].replace("\n", " ")
+        emotion_desc = desc_speaker_data[s_id][i]['emotion_desc'].replace("\n", " ")
+        note = "Note: **Implicit emotion** refers to the internal emotional tendency that is not directly expressed but can help in understanding the speaker's true feelings.\n"
+        desc_msg = f'\n### Given the speaker’s implicit emotion label and its interpretation:\n'
+        implicit_info_msg = (
+            f"\n### Speaker: {speaker_name}\n"
+            f"- Implicit Emotion Label: {emotion_label}\n"
+            f"- Implicit Emotion Interpretation: {emotion_desc}\n"
+        )
+        conv_str = "\n".join(flatten_conv[i])
+        local_context_msg = f"\n### Given the following conversation as a context \n{conv_str}"
+        
+        q_msg =  f'Based on above conversation and implicit emotion label and its interpretation of the speakers, which emotional label of {speaker_name} in the utterance \"{conv["sentences"][i]}\".'
+        label_msg = get_label_map(data_name)[conv['labels'][i]]
+        
+        samples.append({
+            "messages":  [
+                {'role': "system", 'content': system_msg + note + desc_msg + implicit_info_msg + local_context_msg},
+                {'role': "user", 'content': q_msg},
+                {'role': "assistant", 'content': label_msg},
+            ]
+        })
+        
+    return samples 
+
+
+def gen_ImplicitEmotion_V2_prompting_messages(data_name, conv, around_window, s_id, desc_speaker_data):
+    new_conv = []
+    for i,sent in enumerate(conv['sentences']):
+        param = conv['speakers'][i] if data_name == "meld" else conv['genders'][i]
+        sent_name = get_speaker_name(s_id, param, data_name)
+        new_sent =  f'{sent_name}: {sent}'
+        new_conv.append(new_sent)
+    conv_str = "\n".join(new_conv)
+    
+    flatten_conv = flatten_conversation_mixed_by_surrounding(conv['sentences'], around_window, s_id, conv['speakers'] if data_name == "meld" else conv['genders'], data_name)
+    
+    samples = []
+    for i, sent in enumerate(new_conv):
+        system_msg = f'### You are an expert at analyzing the emotion of utterances among speakers in a conversation.\nYour goal is to infer the most accurate **emotion label** for a given utterance.\n'
+        speaker_name = get_speaker_name(s_id, conv['speakers'][i] if data_name == "meld" else conv['genders'][i], data_name)
+        
+        #得到隐性标签和情绪描述的特征描述
+        emotion_surface = desc_speaker_data[s_id][i]['surface_emotion'].replace("\n", " ")
+        emotion_implicit = desc_speaker_data[s_id][i]['implicit_emotion'].replace("\n", " ")
+        note = "Note: *Surface emotion* refers to the emotional state that a person outwardly expresses through their words, tone, facial expressions, or behavior. It is typically visible and can be directly perceived by others. For instance, someone loudly complaining might show a surface emotion of frustration or annoyance.\n*Implicit emotion*, on the other hand, is the underlying emotional tendency that may not be directly expressed but can be inferred through context, common sense reasoning, or deeper understanding of the speaker’s situation. These emotions often reflect the speaker’s true feelings. \n"
+        desc_msg = f'\n### Given the speaker’s Surface Emotion Interpretation and Implicit Emotion Interpretation in the utterance \"{conv["sentences"][i]}\":'
+        implicit_info_msg = (
+            f"\n### Speaker: {speaker_name}\n"
+            f"- Surface Emotion Interpretation: {emotion_surface}\n"
+            f"- Implicit Emotion Interpretation: {emotion_implicit}\n"
+        )
+        conv_str = "\n".join(flatten_conv[i])
+        local_context_msg = f"\n### Given the following conversation as a context \n{conv_str}\n"
+        
+        q_msg =  f'Based on above conversation and Surface Emotion Interpretation and Implicit Emotion Interpretation, which emotional label of {speaker_name} in the utterance \"{conv["sentences"][i]}\".'
+        label_msg = get_label_map(data_name)[conv['labels'][i]]
+        
+        samples.append({
+            "messages":  [
+                {'role': "system", 'content': system_msg + note + local_context_msg + desc_msg + implicit_info_msg },
+                {'role': "user", 'content': q_msg},
+                {'role': "assistant", 'content': label_msg},
+            ]
+        })
+        
+    return samples 
+
+def gen_ImplicitEmotion_V3_prompting_messages(data_name, conv, around_window, s_id, desc_speaker_data, retrieval_library, d_type, visual_expression_data=None, audio_description_data=None, multimodal_config=None, dialogue_rows=None, contrastive_cues_data=None, include_contrastive_cues=False, llm_audio_visual_description_data=None):
+    new_conv = []
+    raw_utterances = conv['sentences']  # 新增：保存原始发言
+    use_multimodal_chat = bool(multimodal_config and multimodal_config.get("multimodal_chat_format"))
+    use_visual_exp = bool(multimodal_config and multimodal_config.get("use_visual_exp"))
+    use_audio_exp = bool(multimodal_config and multimodal_config.get("use_audio_exp"))
+    use_llm_aud_vis_desc = bool(multimodal_config and multimodal_config.get("use_llm_aud_vis_desc"))
+    selected_media_inputs = _get_selected_media_inputs(multimodal_config)
+    for i,sent in enumerate(conv['sentences']):
+        param = conv['speakers'][i] if data_name == "meld" else conv['genders'][i]
+        sent_name = get_speaker_name(s_id, param, data_name)
+        new_sent =  f'{sent_name}: {sent}'
+        new_conv.append(new_sent)
+    conv_str = "\n".join(new_conv)
+    
+    flatten_conv = flatten_conversation_mixed_by_surrounding(conv['sentences'], around_window, s_id, conv['speakers'] if data_name == "meld" else conv['genders'], data_name)
+    
+    samples = []
+    for i, sent in enumerate(new_conv):
+        system_msg = (
+            f'### You are an expert at analyzing the emotion of utterances among speakers in a conversation.\n'
+            f'Your goal is to infer the most accurate **emotion label** for a given utterance.\n\n'
+            
+            # f'### CRITICAL INSTRUCTION:\n'
+            # f'You MUST respond with ONLY the emotion label as a single word.\n'
+            # f'Do NOT provide explanations, reasoning, thinking processes, or additional context.\n'
+            # f'Do NOT use tags like <think>, </think>, arrows (→), or markdown formatting (###).\n\n'
+        )
+        speaker_name = get_speaker_name(s_id, conv['speakers'][i] if data_name == "meld" else conv['genders'][i], data_name)
+        raw_utterance = raw_utterances[i]  # 获取原始发言文本
+        #得到隐性标签和情绪描述的特征描述
+        emotion_surface = desc_speaker_data[s_id][i]['surface_emotion'].replace("\n", " ")
+        emotion_implicit = desc_speaker_data[s_id][i]['implicit_emotion'].replace("\n", " ")
+        desc2 = desc_speaker_data[s_id][i]['desc2'].replace("\n", " ")
+        contrastive_cues = None
+        if include_contrastive_cues and contrastive_cues_data is not None:
+            cues_by_conv = contrastive_cues_data.get(str(s_id)) or contrastive_cues_data.get(s_id)
+            if isinstance(cues_by_conv, list) and i < len(cues_by_conv):
+                contrastive_cues = cues_by_conv[i]
+        # 从检索库中查找相似情感样本（训练集排除自身）
+        similar_samples = retrieve_similar_samples(
+            query_text=raw_utterance,
+            current_id=(s_id, i),
+            d_type=d_type,
+            k=3  # 返回3个最相似样本
+        )
+
+        # 构建示范文本
+        demonstration_str = "### Reference Similar Emotional Expressions:\n"
+        for idx, sample in enumerate(similar_samples, 1):
+            demonstration_str += (
+                f"{idx}. \"{sample['text']}\" → {sample['label']} "
+                f"(from {sample['dataset']}, distance: {sample['distance']:.2f})\n"
+                #f"(from {sample['dataset']}, similarity: {sample['similarity']:.2f})\n"
+            )
+        demonstration_str += "\n"
+        note = ("Note: *Explicit Emotion* refers to the emotional state that a person outwardly expresses through their words, tone, facial expressions, or behavior. It is typically visible and can be directly perceived by others. For instance, someone loudly complaining might show a surface emotion of frustration or annoyance.\n"
+                "*Implicit Emotion*, on the other hand, is the underlying emotional tendency that may not be directly expressed but can be inferred through context, common sense reasoning, or deeper understanding of the speaker's situation. These emotions often reflect the speaker's true feelings.\n")
+        if use_visual_exp:
+            note += (
+                "*Visual Expressions* refer to the non-verbal and facial cues displayed by the speaker, such as eye, eyebrow, cheek, lips and mouth movements. These expressions often correlate with and can reinforce the emotional state being conveyed.\n"
+            )
+        if use_audio_exp:
+            note += (
+                "*Audio Descriptions* refer to prosodic features of the speaker's utterance, including pitch, variability, energy, voice stability, tone quality, and background noise. These acoustic characteristics provide additional cues about the speaker's emotional state and delivery style.\n"
+            )
+        if use_llm_aud_vis_desc:
+            note += (
+                "*Visual Descriptions* refer to high-level observations of the speaker's visible non-verbal behavior, including facial expressiveness, gaze patterns, head movements, posture, mouth activity, and other observable visual actions. These descriptions summarize behavioral cues present in the video and may provide additional context about how the utterance is delivered.\n"
+                "*Audio Descriptions* refer to high-level observations of the speaker's vocal delivery, including speaking rate, pitch variation, vocal energy, emphasis, pauses, hesitations, articulation, and voice stability. These descriptions summarize observable acoustic characteristics that may provide additional context about how the utterance is spoken.\n"
+            )
+        if use_multimodal_chat:
+            media_instruction_phrase = _format_media_input_phrase(selected_media_inputs, definite=False)
+            note += (
+                f"*Multimodal Input Instruction* {media_instruction_phrase.capitalize()} may be provided together with the transcript-based context. "
+                "Use the transcript, facial expressions, visible actions, and prosodic cues jointly. If different modalities conflict, prioritize the evidence that is most directly tied to the current speaker's target utterance. "
+                "Do not mention the modalities in the final answer. Return only one emotion label from the available set.\n"
+            )
+        if contrastive_cues:
+            note += (
+                "*Semantic Contrastive Cues* refer to concise emotional and conversational characteristics that help distinguish a speaker's emotional behavior from other semantically similar emotional expressions. "
+                "Semantic Contrastive Cues highlight discriminative traits. These cues help identify subtle emotional boundaries and reduce confusion between closely related emotions.\n"
+            )
+        
+        desc_msg = f"\n### Given the speaker's Explicit Emotion Interpretation and Implicit Emotion Interpretation in the utterance \'{conv['sentences'][i]}\':"
+        implicit_info_msg = (
+            f"\n### Speaker: {speaker_name}\n"
+            f"- Explicit Emotion Interpretation: {emotion_surface}\n"
+            f"- Implicit Emotion Interpretation: {emotion_implicit}\n"
+        )
+        desc_info_msg = (
+            f"\n### Speaker: {speaker_name}\n"
+            f"- {desc2}\n"
+        )
+        desc_msg_2 = f'\n### Given the characteristic of this speaker: {desc_info_msg}\n'
+        contrastive_cues_msg = ""
+        include_contrastive_in_prompt = False
+        if contrastive_cues:
+            contrastive_cues_msg = (
+                "\n### Semantic Contrastive Cues for the speaker in this utterance:\n"
+                f"- {contrastive_cues}\n"
+            )
+            include_contrastive_in_prompt = True
+        visual_expression_msg = ""
+        if use_visual_exp and visual_expression_data is not None:
+            visual_info = visual_expression_data.get(str(s_id), {})
+            visual_expressions = visual_info.get("visual_expressions") or visual_info.get("visual_descriptions", [])
+            current_visual_expression = (
+                visual_expressions[i]
+                if i < len(visual_expressions)
+                else None
+            )
+            if current_visual_expression:
+                visual_expression_msg = (
+                    "\n### Visual Expressions of the speaker present in this utterance:\n"
+                    f"- {current_visual_expression}\n"
+                )
+
+        audio_description_msg = ""
+        if use_audio_exp and audio_description_data is not None:
+            audio_info = audio_description_data.get(str(s_id), {})
+            audio_descriptions = audio_info.get("audio_descriptions", [])
+            current_audio_description = (
+                audio_descriptions[i]
+                if i < len(audio_descriptions)
+                else None
+            )
+            if current_audio_description:
+                audio_description_msg = (
+                    "\n### Audio Characteristics of the speaker present in this utterance:\n"
+                    f"- {current_audio_description}\n"
+                )
+
+        llm_audio_visual_description_msg = ""
+        if use_llm_aud_vis_desc and llm_audio_visual_description_data is not None:
+            av_info = llm_audio_visual_description_data.get(str(s_id), {})
+            av_predictions = av_info.get("emotion_predictions", [])
+            current_av_prediction = (
+                av_predictions[i]
+                if i < len(av_predictions)
+                else {}
+            )
+            current_visual_description = current_av_prediction.get("visual_description", "").strip()
+            current_audio_description = current_av_prediction.get("audio_description", "").strip()
+            av_description_lines = []
+            if current_visual_description:
+                av_description_lines.append(f"- Visual Description: {current_visual_description}")
+            if current_audio_description:
+                av_description_lines.append(f"- Audio Description: {current_audio_description}")
+            if av_description_lines:
+                llm_audio_visual_description_msg = (
+                    "\n### Audio and Visual Descriptions of the speaker present in this utterance:\n"
+                    + "\n".join(av_description_lines)
+                    + "\n"
+                )
+
+        conv_str = "\n".join(flatten_conv[i])
+        local_context_msg = (f"\n### Given the following conversation as a context \n{conv_str}\n"
+                             )
+        
+        emotion_labels = get_label_map(data_name)
+        labels_msg = f"### Available emotion labels: {', '.join(emotion_labels)}\n\n"
+        enabled_prompt_features = _format_feature_list(
+            use_visual_exp=use_visual_exp,
+            use_audio_exp=use_audio_exp,
+            use_llm_aud_vis_desc=use_llm_aud_vis_desc,
+        )
+        prompt_feature_text = _join_prompt_features(enabled_prompt_features)
+        prompt_feature_prefix = f"{prompt_feature_text}, " if prompt_feature_text else ""
+        contrastive_q_fragment = "Semantic Contrastive Cues, " if include_contrastive_in_prompt else ""
+
+        if use_multimodal_chat:
+            media_prompt_phrase = _format_media_input_phrase(selected_media_inputs, definite=True)
+            q_msg = (f'Based on the conversation context, {media_prompt_phrase}, '
+                     f'{prompt_feature_prefix}similar emotional expressions, '
+                     f'{contrastive_q_fragment}Explicit Emotion Interpretation, Implicit Emotion Interpretation and characteristic, '
+                     f'which emotional label of {speaker_name} in the utterance \"{conv["sentences"][i]}\"? '
+                     f'Respond with only one label from the available emotion labels.')
+        else:
+            q_msg = (f'Based on above conversation, {prompt_feature_prefix}similar emotional expressions, '
+                     f'{contrastive_q_fragment}Explicit Emotion Interpretation, Implicit Emotion Interpretation and characteristic, '
+                     f'which emotional label of {speaker_name} in the utterance \"{conv["sentences"][i]}\".')
+        
+        label_msg = get_label_map(data_name)[conv['labels'][i]]
+
+        video_path = None
+        audio_path = None
+        image_path = None
+        if use_multimodal_chat and data_name == "meld":
+            media_dialogue_id = None
+            media_utterance_id = None
+            if dialogue_rows is not None and i < len(dialogue_rows):
+                media_dialogue_id = dialogue_rows[i].get("dialogue_id")
+                media_utterance_id = dialogue_rows[i].get("csv_utterance_id")
+            video_path, audio_path, image_path = _build_meld_media_paths(
+                s_id,
+                i,
+                multimodal_config,
+                d_type,
+                dialogue_media_id=media_dialogue_id,
+                utterance_media_id=media_utterance_id,
+            )
+            if "video" not in selected_media_inputs:
+                video_path = None
+            if "audio" not in selected_media_inputs:
+                audio_path = None
+            if "image" not in selected_media_inputs:
+                image_path = None
+
+        full_system_msg = system_msg + note + local_context_msg + visual_expression_msg + audio_description_msg + llm_audio_visual_description_msg + desc_msg_2 + desc_msg + implicit_info_msg + contrastive_cues_msg + demonstration_str + labels_msg
+        if use_multimodal_chat:
+            messages = _build_multimodal_messages(
+                full_system_msg,
+                q_msg,
+                label_msg,
+                video_path=video_path,
+                audio_path=audio_path,
+                image_path=image_path,
+            )
+        else:
+            messages = [
+                {'role': "system", 'content': full_system_msg},
+                {'role': "user", 'content': q_msg},
+                {'role': "assistant", 'content': label_msg},
+            ]
+
+        sample = {
+            "messages": messages,
+            "conversation_id": str(s_id),
+            "utterance_id": i,
+        }
+        if video_path is not None:
+            sample["video_path"] = video_path
+        if audio_path is not None:
+            sample["audio_path"] = audio_path
+        if image_path is not None:
+            sample["image_path"] = image_path
+        samples.append(sample)
+        
+    return samples 
+
+def calculate_difficulty(dialog_data, emotionmap, matrix, emotion_to_index, data_name):
+    labels = dialog_data['labels']
+    genders = dialog_data['genders']
+    if data_name == 'meld':
+        speakers = dialog_data['speakers']
+    # 1. 基本统计
+    num_utterances = len(labels)
+    if data_name == 'meld':
+        speakers_set = set(speakers)
+    elif data_name == 'emorynlp':
+        genders_labels = [gender.index(1) for gender in genders]
+        speakers_set = set(genders_labels)
+    else:
+        speakers_set = set(genders)
+    num_speakers = len(speakers_set)
+
+    speaker_emo = {}
+    if data_name == 'meld':
+        for i in range(0, num_utterances):
+            if (speakers[i] in speaker_emo):
+                speaker_emo[speakers[i]].append(emotionmap[labels[i]])
+            else:
+                speaker_emo[speakers[i]] = [emotionmap[labels[i]]]    
+    elif data_name == 'emorynlp':
+        for i in range(0, num_utterances):
+            gender_label = genders[i].index(1)  # 将 one-hot 向量转换为标签
+            emo = emotionmap[labels[i]]
+            if gender_label in speaker_emo:
+                speaker_emo[gender_label].append(emo)
+            else:
+                speaker_emo[gender_label] = [emo]
+    else:
+        for i in range(0, num_utterances):
+            if (genders[i] in speaker_emo):
+                speaker_emo[genders[i]].append(emotionmap[labels[i]])
+            else:
+                speaker_emo[genders[i]] = [emotionmap[labels[i]]]   
+   # print('speaker_emo')
+   # print(speaker_emo)
+    emotion_shift_weighted = 0
+    numberofemotionshifts = 0
+    k = 1  # 情感变化权重系数
+    b = 0.4  # 基础偏移量
+
+    for key in speaker_emo:
+        #  prev_emo = None
+        for i in range(0, len(speaker_emo[key]) - 1):
+            current_emo = speaker_emo[key][i]
+            next_emo = speaker_emo[key][i + 1]
+            if current_emo != next_emo and current_emo != 'null' and next_emo != 'null':
+                numberofemotionshifts += 1
+                current_emo_index = emotion_to_index[current_emo]
+                next_emo_index = emotion_to_index[next_emo]
+                #线性缩放
+                #当k为正数时，similarity_score越小说明差距越大，越大说明差距越小,侧重于差距小的情感
+                #当k为负数时，反之，侧重于差距大的情感
+                similarity_score = abs(matrix[current_emo_index][next_emo_index]) * k + b
+                emotion_shift_weighted += similarity_score
+
+    if data_name == 'meld':            
+        speaker_turns = sum([speakers[i] != speakers[i-1] for i in range(1, len(speakers))])
+    else:
+        speaker_turns = sum([genders[i] != genders[i-1] for i in range(1, len(genders))])
+
+    cross_speaker_emotion_shift = 0
+    for i in range(1, num_utterances):
+        if genders[i] != genders[i-1]:
+            emo1 = emotionmap[labels[i]]
+            emo2 = emotionmap[labels[i-1]]
+            if emo1 != emo2 and emo1 != 'null' and emo2 != 'null':
+                idx1 = emotion_to_index[emo1]
+                idx2 = emotion_to_index[emo2]
+                similarity_score = abs(matrix[idx1][idx2]) * k + b
+                cross_speaker_emotion_shift += similarity_score
+   # speaker_turns = (sum([genders[i] != genders[i-1] for i in range(1, len(genders))])) * b2
+    difficulty = (emotion_shift_weighted + num_speakers ) / (num_utterances + num_speakers)
+   # difficulty2 = (numberofemotionshifts + num_speakers ) / (num_utterances + num_speakers)
+    #difficulty3 = (emotion_shift_weighted + num_speakers + speaker_turns) / (num_utterances + num_speakers)
+    difficulty4 = (emotion_shift_weighted + num_speakers + cross_speaker_emotion_shift ) / (num_utterances + num_speakers)
+    difficulty5 = (numberofemotionshifts + num_speakers + speaker_turns ) / (num_utterances + num_speakers)
+    return difficulty4
+
+def process(paths_folder_preprocessed_data, args):
+    
+    process_kwargs = {}
+    include_auxiliary_labels = bool(getattr(args, "include_auxiliary_labels", False))
+    multimodal_config = {
+        "multimodal_chat_format": getattr(args, "multimodal_chat_format", False),
+        "use_visual_exp": getattr(args, "use_visual_exp", False),
+        "use_audio_exp": getattr(args, "use_audio_exp", False),
+        "use_llm_aud_vis_desc": getattr(args, "use_llm_aud_vis_desc", False),
+        "video_input": getattr(args, "video_input", False),
+        "image_input": getattr(args, "image_input", False),
+        "audio_input": getattr(args, "audio_input", False),
+        "meld_train_video_dir": getattr(args, "meld_train_video_dir", None),
+        "meld_valid_video_dir": getattr(args, "meld_valid_video_dir", None),
+        "meld_test_video_dir": getattr(args, "meld_test_video_dir", None),
+        "meld_train_audio_dir": getattr(args, "meld_train_audio_dir", None),
+        "meld_valid_audio_dir": getattr(args, "meld_valid_audio_dir", None),
+        "meld_test_audio_dir": getattr(args, "meld_test_audio_dir", None),
+        "meld_train_image_dir": getattr(args, "meld_train_image_dir", None),
+        "meld_valid_image_dir": getattr(args, "meld_valid_image_dir", None),
+        "meld_test_image_dir": getattr(args, "meld_test_image_dir", None),
+        "meld_sentiment_csv_map": {
+            "train": getattr(args, "meld_train_sentiment_csv", DEFAULT_MELD_SENTIMENT_CSVS["train"]),
+            "valid": getattr(args, "meld_valid_sentiment_csv", DEFAULT_MELD_SENTIMENT_CSVS["valid"]),
+            "test": getattr(args, "meld_test_sentiment_csv", DEFAULT_MELD_SENTIMENT_CSVS["test"]),
+        },
+    }
+    #paths_folder_preprocessed_data: 一个列表，包含预处理数据的路径
+    for path_folder_preprocessed_data in paths_folder_preprocessed_data:
+        
+        d_type = 'train' if '.train.' in path_folder_preprocessed_data else \
+                'valid' if '.valid.' in path_folder_preprocessed_data else \
+                'test' if '.test.' in path_folder_preprocessed_data else None  
+        '''
+        folder_data: 数据所在文件夹
+        around_window: 设定用于构建上下文窗口大小
+        data_name: 数据集名称，如 "meld"
+        path_data_out: 最终输出文件路径
+        prompting_type: prompt 类型，如 "default" 或 "spdescV2"
+        extract_prompting_llm_id: LLM 的 ID，用于加载说话人描述信息
+        '''
+        folder_data = args.data_folder
+        around_window = args.window
+        data_name = args.data_name
+        path_data_out = path_folder_preprocessed_data
+        prompting_type = args.prompting_type
+        extract_prompting_llm_id = args.extract_prompting_llm_id 
+        
+        raw_data = f'{folder_data}/{data_name}.{d_type}.json'
+        org_data = json.load(open(raw_data)) # ; org_data = dict([(k,v) for k,v in org_data.items()][:10])
+        visual_expression_data = (
+            load_dialogue_visual_expressions(folder_data, d_type, data_name=data_name)
+            if prompting_type == 'ImplicitEmotion_V3' and multimodal_config["use_visual_exp"]
+            else None
+        )
+        audio_description_data = (
+            load_dialogue_audio_descriptions(folder_data, d_type, data_name=data_name)
+            if prompting_type == 'ImplicitEmotion_V3' and multimodal_config["use_audio_exp"]
+            else None
+        )
+        llm_audio_visual_description_data = (
+            load_dialogue_llm_audio_visual_descriptions(folder_data, data_name, d_type)
+            if prompting_type == 'ImplicitEmotion_V3' and multimodal_config["use_llm_aud_vis_desc"]
+            else None
+        )
+        include_contrastive_cues = bool(getattr(args, "include_contrastive_cues", False))
+        contrastive_cues_data = None
+        if include_contrastive_cues and prompting_type == 'ImplicitEmotion_V3':
+            cues_prompt_type = "SemanticContrastiveCues_V1"
+            cues_path = f'{folder_data}/{data_name}.{d_type}_{cues_prompt_type}_{extract_prompting_llm_id}.json'
+            if os.path.exists(cues_path):
+                contrastive_raw = json.load(open(cues_path))
+                contrastive_cues_data = {
+                    str(conv_id): [
+                        pred.get("semantic_contrastive_cues", "")
+                        for pred in conv_data.get("emotion_predictions", [])
+                    ]
+                    for conv_id, conv_data in contrastive_raw.items()
+                }
+            else:
+                print(f"- Semantic contrastive cues file not found: {cues_path}. Skipping cues.")
+                include_contrastive_cues = False
+        
+        new_format = []
+        meld_sentiment_lookup = (
+            get_meld_sentiment_lookup(multimodal_config, d_type)
+            if data_name == "meld"
+            else {}
+        )
+        
+        # if use speaker description -> load raw data and preprocess
+        #prompt 类型不是 "default"，则从指定文件中加载“说话人描述”
+        if prompting_type not in ["default" ]:
+            desc_speaker_data = json.load(open(f'{folder_data}/{data_name}.{d_type}_{prompting_type}_{extract_prompting_llm_id}.json'))
+            desc_speaker_data_2 = json.load(open(f'{folder_data}/{data_name}.{d_type}_spdescV6_qwen_3_14b.json'))
+            processed_desc_speaker_data = {}
+            #如果 prompt 类型中包含 "spdesc"，就用 preprocess_desc_speaker 函数对每条描述做预处理：
+            if desc_speaker_data is not None and "spdescV2" == prompting_type:
+                for s_id, desc_all_conv in desc_speaker_data.items():
+                    processed_desc_speaker_data[s_id] = [preprocess_desc_speaker(spdesc) for spdesc in desc_all_conv]
+                #最终存入 desc_speaker_data 字典中
+                desc_speaker_data = processed_desc_speaker_data
+            combined_dict = {}
+            if  desc_speaker_data is not None and prompting_type in ["spdescV3", "spdescV4", "spdescV5"]:
+                for s_id, conv_data in desc_speaker_data.items():
+                    if not isinstance(conv_data, list):
+                        continue
+                    response_list = []
+                    for item in conv_data:
+                        if isinstance(item, str):
+                            try:
+                                # 替换非法反斜杠（如：\c 变成 \\c）
+                                safe_item = re.sub(r'\\(?![\"\\/bfnrtu])', r'\\\\', item)
+                                parsed = json.loads(safe_item)
+                                if "Response" in parsed:
+                                    response_list.append({"response": parsed["Response"]})
+                                else:
+                                    response_list.append({"response": "null"})
+                            except json.JSONDecodeError as e:
+                                print(f"❌ JSON解析失败，s_id: {s_id}，错误信息: {e}")
+                                response_list.append({"response": "null"})
+                    combined_dict[s_id] = response_list
+
+                desc_speaker_data = combined_dict
+                #print(desc_speaker_data)
+            if  desc_speaker_data is not None and "ImplicitEmotion" == prompting_type:
+                combined_dict = {
+                    s_id: [
+                        {
+                            "emotion_label": emotion['implicit_emotion'],
+                            "emotion_desc": emotion['emotion_desc']
+                        } for emotion in conv_data['emotion_predictions']
+                    ]
+                    for s_id, conv_data in desc_speaker_data.items()
+                }
+                desc_speaker_data = combined_dict
+            if desc_speaker_data is not None and prompting_type in [
+                "ImplicitEmotion_V2", "ImplicitEmotion_V2_byQwen3_14b", "ImplicitEmotion_V3", "ImplicitEmotion_V4"
+            ]:
+                combined_dict = {}
+                for s_id, conv_data in desc_speaker_data.items():
+                    # 从 desc_speaker_data 提取 implicit/surface 情感
+                    emotions_1 = [
+                        {
+                            "surface_emotion": emotion['surface_emotion'],
+                            "implicit_emotion": emotion['implicit_emotion']
+                        } for emotion in conv_data['emotion_predictions']
+                    ]
+
+                    # 尝试从 desc_speaker_data_2 中提取额外信息（可根据格式修改）
+                    emotions_2 = []
+                    if s_id in desc_speaker_data_2:
+                        try:
+                            emotions_2 = [preprocess_desc_speaker(spdesc) for spdesc in desc_speaker_data_2[s_id]]
+                        except Exception as e:
+                            print(f"❌ 处理 desc_speaker_data_2 失败，s_id: {s_id}，错误信息: {e}")
+                            emotions_2 = ["null"] * len(emotions_1)
+
+                    # 合并两个来源的描述
+                    combined_dict[s_id] = [
+                        {
+                            **emotions_1[i],
+                            "desc2": emotions_2[i] if i < len(emotions_2) else "null"
+                        }
+                        for i in range(len(emotions_1))
+                    ]
+
+                desc_speaker_data = combined_dict
+
+        else:#是 default 类型，则不使用说话人描述
+            desc_speaker_data = None
+            
+        # path data out 设置输出文件路径,默认将原始路径 .json 替换成 .jsonl 并加上 prompting 类型和 window
+        path_processed_data = raw_data.replace(".json", f".0shot_w{around_window}_{prompting_type}.jsonl") if path_data_out is None else path_data_out
+        
+        # prompting process function 
+        process_function_map = {
+            "spdescV2": gen_spdescV2_prompting_messages,
+            "spdescV3": gen_spdescV3_prompting_messages,
+            "spdescV4": gen_spdescV3_prompting_messages,
+            "spdescV5": gen_spdescV5_prompting_messages,
+            "default": gen_default_prompting_messages,
+            "ImplicitEmotion" : gen_ImplicitEmotion_prompting_messages,
+            'ImplicitEmotion_V2' : gen_ImplicitEmotion_V2_prompting_messages,
+            'ImplicitEmotion_V2_byQwen3_14b' : gen_ImplicitEmotion_V2_prompting_messages,
+            'ImplicitEmotion_V3' : gen_ImplicitEmotion_V3_prompting_messages,
+            #'ImplicitEmotion_V4': gen_ImplicitEmotion_V4_prompting_messages
+        }
+        #预定义的函数映射表中选出用于生成 prompt 的函数。如果找不到就默认用 "default"。
+        process_func = process_function_map.get(prompting_type, process_function_map['default'])
+        print(f"- process prompting by {process_func.__name__}")
+        if d_type == 'train':
+            emotionmap = get_emotion_map(data_name)
+            matrix, emotion_to_index = similarity_matrix.get_similarity_matrix(data_name)
+        #遍历原始数据中的每条对话
+        for dialogue_position, (s_id, conv) in enumerate(org_data.items()): 
+            dialogue_rows = (
+                get_meld_dialogue_rows(meld_sentiment_lookup, str(s_id), dialogue_position)
+                if data_name == "meld"
+                else []
+            )
+           # 根据不同的prompting_type构造不同的参数
+            if prompting_type == 'ImplicitEmotion_V3':
+                samples = process_func(
+                    data_name,
+                    conv,
+                    around_window,
+                    s_id,
+                    desc_speaker_data,
+                    None,
+                    d_type,
+                    visual_expression_data,
+                    audio_description_data,
+                    multimodal_config,
+                    dialogue_rows,
+                    contrastive_cues_data=contrastive_cues_data,
+                    include_contrastive_cues=include_contrastive_cues,
+                    llm_audio_visual_description_data=llm_audio_visual_description_data,
+                )
+            elif prompting_type in ['spdescV3', 'spdescV4', 'spdescV5']:
+                samples = process_func(data_name, conv, around_window, s_id, desc_speaker_data, None, d_type)
+            else:
+                # 其他函数使用标准参数
+                samples = process_func(data_name, conv, around_window, s_id, desc_speaker_data)
+
+            if include_auxiliary_labels:
+                for sample_idx, sample in enumerate(samples):
+                    utterance_id = int(sample.get("utterance_id", sample_idx))
+                    sample["conversation_id"] = str(sample.get("conversation_id", s_id))
+                    sample["utterance_id"] = utterance_id
+                    sample["emotion_label"] = get_label_map(data_name)[conv['labels'][utterance_id]]
+                    if data_name == "meld":
+                        sentiment_info = None
+                        if utterance_id < len(dialogue_rows):
+                            candidate = dialogue_rows[utterance_id]
+                            if (
+                                candidate["speaker"] == conv["speakers"][utterance_id]
+                                and candidate["utterance"] == conv["sentences"][utterance_id]
+                            ):
+                                sentiment_info = candidate
+                        if sentiment_info is None:
+                            sentiment_info = get_meld_sentiment_info(
+                                meld_sentiment_lookup,
+                                dialogue_id=str(s_id),
+                                utterance_position=utterance_id,
+                                speaker=conv["speakers"][utterance_id],
+                                utterance_text=conv["sentences"][utterance_id],
+                            )
+                        if sentiment_info is None:
+                            raise KeyError(
+                                f"Missing MELD sentiment metadata for split={d_type}, "
+                                f"dialogue_id={s_id}, utterance_id={utterance_id}"
+                            )
+                        sample["emotion_label"] = sentiment_info["emotion_label"]
+                        sample["sentiment_label"] = sentiment_info["sentiment_label"]
+                    else:
+                        sample["sentiment_label"] = None
+
+            if d_type == 'train':
+                difficulty = calculate_difficulty(conv, emotionmap, matrix, emotion_to_index, data_name)
+                for sample in samples:
+                    sample["difficulty"] = round(difficulty, 4)
+            if d_type != 'train':
+                for sample in samples:
+                    sample["difficulty"] = 0.0  # 统一默认值
+            #将所有样本拼接到 new_format 中
+            new_format = new_format + samples
+        
+        #每条 sample 转成 JSON 字符串格式。    
+        with open(f'{path_processed_data}', 'wt') as f:
+            new_format = [json.dumps(e) for e in new_format]
+            f.write("\n".join(new_format))
+
+
+if __name__=="__main__":
+    import argparse
+    
+    # Create argument parser
+    parser = argparse.ArgumentParser(description='Reformat conversation data for LLM training')
+    parser.add_argument('--data_name', type=str, default='meld', 
+                        help='Dataset name: meld, iemocap, emorynlp, dailydialog')
+    parser.add_argument('--window', type=int, default=5, 
+                        help='Context window size')
+    parser.add_argument('--prompting_type', type=str, default='ImplicitEmotion_V3',
+                        help='Prompting type: default, spdescV2, ImplicitEmotion_V3, etc.')
+    parser.add_argument('--extract_prompting_llm_id', type=str, default='qwen_3_14b',
+                        help='LLM ID for speaker descriptions')
+    parser.add_argument('--data_folder', type=str, default='./data',
+                        help='Folder containing dataset files')
+    parser.add_argument('--re_gen_data', action='store_true',
+                        help='Force regenerate data even if exists')
+    parser.add_argument('--multimodal_chat_format', action='store_true',
+                        help='Emit Qwen2.5 Omni style structured message content and media paths')
+    parser.add_argument('--video_input', action='store_true',
+                        help='Include video input paths in the multimodal user message')
+    parser.add_argument('--image_input', action='store_true',
+                        help='Include image input paths in the multimodal user message')
+    parser.add_argument('--audio_input', action='store_true',
+                        help='Include audio input paths in the multimodal user message')
+    parser.add_argument('--use_audio_exp', action='store_true',
+                        help='Include audio-description features in the text prompt when available')
+    parser.add_argument('--use_visual_exp', action='store_true',
+                        help='Include visual-expression features in the text prompt when available')
+    parser.add_argument('--use_llm_aud_vis_desc', action='store_true',
+                        help='Include LLM-generated audio and visual descriptions in the text prompt')
+    parser.add_argument('--meld_train_video_dir', type=str, default='/scratch/data/bikash_rs/Vivek/dataset/MELD/MELD.Raw/train_splits',
+                        help='MELD train video directory')
+    parser.add_argument('--meld_valid_video_dir', type=str, default='/scratch/data/bikash_rs/Vivek/dataset/MELD/MELD.Raw/dev_splits_complete',
+                        help='MELD valid video directory')
+    parser.add_argument('--meld_test_video_dir', type=str, default='/scratch/data/bikash_rs/Vivek/dataset/MELD/MELD.Raw/output_repeated_splits_test',
+                        help='MELD test video directory')
+    parser.add_argument('--meld_train_audio_dir', type=str, default='/scratch/data/bikash_rs/Vivek/dataset/MELD_audio/train',
+                        help='MELD train audio directory')
+    parser.add_argument('--meld_valid_audio_dir', type=str, default='/scratch/data/bikash_rs/Vivek/dataset/MELD_audio/dev',
+                        help='MELD valid audio directory')
+    parser.add_argument('--meld_test_audio_dir', type=str, default='/scratch/data/bikash_rs/Vivek/dataset/MELD_audio/test',
+                        help='MELD test audio directory')
+    parser.add_argument('--meld_train_image_dir', type=str, default='/scratch/data/bikash_rs/Vivek/dataset/MELD_face_crops/train',
+                        help='MELD train face-crop image directory')
+    parser.add_argument('--meld_valid_image_dir', type=str, default='/scratch/data/bikash_rs/Vivek/dataset/MELD_face_crops/dev',
+                        help='MELD valid face-crop image directory')
+    parser.add_argument('--meld_test_image_dir', type=str, default='/scratch/data/bikash_rs/Vivek/dataset/MELD_face_crops/test',
+                        help='MELD test face-crop image directory')
+    parser.add_argument('--meld_train_sentiment_csv', type=str, default=DEFAULT_MELD_SENTIMENT_CSVS["train"],
+                        help='MELD train sentiment CSV path')
+    parser.add_argument('--meld_valid_sentiment_csv', type=str, default=DEFAULT_MELD_SENTIMENT_CSVS["valid"],
+                        help='MELD valid sentiment CSV path')
+    parser.add_argument('--meld_test_sentiment_csv', type=str, default=DEFAULT_MELD_SENTIMENT_CSVS["test"],
+                        help='MELD test sentiment CSV path')
+    parser.add_argument('--include_auxiliary_labels', action='store_true',
+                        help='Add emotion_label and sentiment_label fields to generated JSONL samples')
+    parser.add_argument('--include_contrastive_cues', action='store_true',
+                        help='Include semantic contrastive cues in prompts and output filename')
+    
+    args = parser.parse_args()
+
+    if args.use_llm_aud_vis_desc and (args.use_audio_exp or args.use_visual_exp):
+        parser.error(
+            "--use_llm_aud_vis_desc is mutually exclusive with --use_audio_exp and --use_visual_exp. "
+            "Choose either the LLM-generated audio/visual descriptions or the existing audio/visual feature flags."
+        )
+    
+    # Generate paths for train/valid/test
+    feature_suffix_parts = []
+    media_input_suffix_parts = []
+    if args.video_input:
+        media_input_suffix_parts.append("video")
+    if args.image_input:
+        media_input_suffix_parts.append("image")
+    if args.audio_input:
+        media_input_suffix_parts.append("audio")
+
+    if args.use_audio_exp:
+        feature_suffix_parts.append("Aud")
+    if args.use_visual_exp:
+        feature_suffix_parts.append("Vis")
+    if args.use_llm_aud_vis_desc:
+        feature_suffix_parts.append("LLM_Aud_Vis_Desc")
+    if args.include_auxiliary_labels:
+        feature_suffix_parts.append("Aux_Labels")
+    if args.include_contrastive_cues:
+        feature_suffix_parts.append("con")
+    if args.multimodal_chat_format and not media_input_suffix_parts:
+        media_input_suffix_parts = ["video", "audio"]
+
+    suffix_parts = media_input_suffix_parts + feature_suffix_parts
+    feature_suffix = "_" + "_".join(suffix_parts) if suffix_parts else ""
+    output_suffix = f"{feature_suffix}_Omni.jsonl" if args.multimodal_chat_format else f"{feature_suffix}.jsonl"
+    paths = [
+        f"{args.data_folder}/{args.data_name}.{d_type}.0shot_w{args.window}_{args.prompting_type}_{args.extract_prompting_llm_id}{output_suffix}"
+        for d_type in ['train', 'valid', 'test']
+    ]
+    
+    # Process all splits
+    print(f"\n{'='*80}")
+    print(f"Starting data generation with configuration:")
+    print(f"  Dataset: {args.data_name}")
+    print(f"  Window size: {args.window}")
+    print(f"  Prompting type: {args.prompting_type}")
+    print(f"  Output paths: {paths}")
+    print(f"{'='*80}\n")
+    
+    process(paths, args)
+    
+    print(f"\n{'='*80}")
+    print(f"✅ Data generation completed!")
+    print(f"{'='*80}\n")
